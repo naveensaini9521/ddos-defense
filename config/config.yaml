@@ -1,0 +1,23 @@
+app:
+  name: ddos-defense
+  log_level: INFO
+
+collector:
+  window_seconds: 10
+  source: nginx
+
+ml:
+  model_path: ml/models/v1.pkl
+  threshold: 0.7
+
+blocker:
+  backend: iptables     # iptables | nftables | null
+  default_ttl: 60
+  backoff:
+    - 60
+    - 300
+    - 1800
+
+api:
+  host: 0.0.0.0
+  port: 8000

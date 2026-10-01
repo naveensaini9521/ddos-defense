@@ -1,0 +1,10 @@
+groups:
+  - name: ddos
+    rules:
+      - alert: HighAttackRate
+        expr: ddos_attack_probability > 0.7
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "High attack probability detected"

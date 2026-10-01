@@ -1,0 +1,11 @@
+{
+  "current": "v1",
+  "versions": {
+    "v1": {
+      "path": "models/v1.pkl",
+      "features": "core.schema.FEATURE_NAMES",
+      "trained_at": null,
+      "metrics": {}
+    }
+  }
+}

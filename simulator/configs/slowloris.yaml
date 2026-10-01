@@ -1,0 +1,5 @@
+name: slowloris
+layer: L7
+duration: 120
+connections: 200
+keepalive_seconds: 10

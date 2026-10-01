@@ -1,0 +1,16 @@
+# Copy to config.yaml and edit.
+app:
+  name: ddos-defense
+  log_level: DEBUG
+collector:
+  window_seconds: 10
+  source: nginx
+ml:
+  model_path: ml/models/v1.pkl
+  threshold: 0.7
+blocker:
+  backend: null
+  default_ttl: 60
+api:
+  host: 0.0.0.0
+  port: 8000

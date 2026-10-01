@@ -1,0 +1,8 @@
+name: http_flood
+layer: L7
+duration: 60
+threads: 50
+requests_per_thread: 200
+headers:
+  X-Forwarded-For: rotate
+  User-Agent: rotate

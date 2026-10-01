@@ -1,0 +1,5 @@
+name: syn_flood
+layer: L4
+duration: 60
+packets_per_second: 5000
+spoof_source_ip: true
