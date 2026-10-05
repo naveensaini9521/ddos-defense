@@ -1,20 +1,16 @@
 """Realistic DDoS attack scenarios.
 
-Each scenario mimics how a real attacker operates — not just a single
-flood, but realistic patterns with phases, jitter, and evasion techniques.
+Each scenario mimics how a real attacker operates — with phases, jitter,
+and (for dynamic_ip) rotating source IPs via X-Forwarded-For.
 
 Scenarios:
-    - http_flood       : Simple volumetric flood
+    - http_flood       : Volumetric flood, one IP
     - slowloris        : Low-and-slow connection exhaustion
-    - ramping_flood    : Gradual increase (tests temporal models)
-    - bursty_flood     : Bursts with gaps (tests burst detection)
-    - distributed      : Many threads from one IP
-    - mixed            : Normal traffic + attack blend (realistic)
-
-Each scenario:
-    - Runs for a specified duration
-    - Emits per-phase labels
-    - Records ground truth to data/labeled/
+    - ramping_flood    : Gradual increase (tests temporal detection)
+    - bursty_flood     : On/off bursts (tests burst detection)
+    - distributed      : XFF spoofing (botnet simulation)
+    - mixed            : Normal traffic + attack blend
+    - dynamic_ip       : Rotating IPs, 1 request per IP
 """
 from __future__ import annotations
 
@@ -23,9 +19,8 @@ import random
 import socket
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -37,14 +32,14 @@ log = get_logger("simulator.attack_scenarios")
 LABEL_DIR = Path("data/labeled")
 
 
-# ---------------------------------------------------------------------------
-# Label record — one per scenario run
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Label record
+# ===========================================================================
 
 @dataclass
 class AttackLabel:
     scenario: str
-    phase: str                # "warmup", "attack", "cooldown"
+    phase: str
     ts_start: float
     ts_end: float
     target: str
@@ -64,9 +59,9 @@ def write_label(label: AttackLabel) -> None:
         f.write(json.dumps(asdict(label)) + "\n")
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # HTTP session helper
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def make_session(pool: int = 100) -> requests.Session:
     s = requests.Session()
@@ -76,13 +71,11 @@ def make_session(pool: int = 100) -> requests.Session:
     return s
 
 
-# ---------------------------------------------------------------------------
-# Scenario base
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Base class
+# ===========================================================================
 
 class ScenarioBase:
-    """Common logic for all scenarios."""
-
     name = "base"
 
     def __init__(self, target: str, timeout: float = 3.0) -> None:
@@ -111,38 +104,55 @@ class ScenarioBase:
     def stop(self) -> None:
         self._stop.set()
 
-    def run(self, duration: int) -> AttackLabel:
-        """Override in subclasses."""
+    def run(self, duration: int, **kwargs) -> AttackLabel:
         raise NotImplementedError
 
 
-# ---------------------------------------------------------------------------
-# Scenario 1 — HTTP flood (simple volumetric)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 1. HTTP flood
+# ===========================================================================
 
 class HTTPFlood(ScenarioBase):
     name = "http_flood"
 
+    USER_AGENTS = [
+        "curl/7.8.0", "curl/8.5.0",
+        "python-requests/2.31.0", "python-urllib/3.10",
+        "Wget/1.21.2", "Go-http-client/1.1",
+        "okhttp/4.9.3", "Java/1.8.0_292",
+        "PostmanRuntime/7.32.0",
+        "Apache-HttpClient/4.5.13",
+    ]
+
+    PATHS = [
+        "/", "/api/data", "/health", "/static/style.css",
+        "/img/logo.png", "/index.html", "/favicon.ico",
+        "/api/v1/users", "/api/v1/products",
+    ]
+
     def run(self, duration: int = 30, threads: int = 30,
-            paths: list[str] | None = None) -> AttackLabel:
-        paths = paths or ["/", "/api/data", "/health"]
+            **kwargs) -> AttackLabel:
         self.reset()
         self._stop.clear()
         start = time.time()
 
-        def worker():
+        def worker(tid: int):
             session = make_session(pool=10)
+            ua = random.choice(self.USER_AGENTS)
             while not self._stop.is_set() and (time.time() - start) < duration:
                 try:
-                    r = session.get(
-                        self.target + random.choice(paths).lstrip("/"),
-                        timeout=self.timeout,
-                    )
+                    path = random.choice(self.PATHS).lstrip("/")
+                    headers = {"User-Agent": ua}
+                    if random.random() < 0.3:
+                        headers["Referer"] = f"http://{self._host()}/"
+                    r = session.get(self.target + path, headers=headers,
+                                    timeout=self.timeout)
                     self._inc(r.status_code < 500)
                 except Exception:
                     self._inc(False)
 
-        ws = [threading.Thread(target=worker, daemon=True) for _ in range(threads)]
+        ws = [threading.Thread(target=worker, args=(i,), daemon=True)
+              for i in range(threads)]
         for w in ws:
             w.start()
         for w in ws:
@@ -156,22 +166,25 @@ class HTTPFlood(ScenarioBase):
             source_ips=["<local>"],
             requests_sent=sent, errors=errs,
             threads=threads, rps_target=0.0,
-            description=f"HTTP flood: {threads} threads, {duration}s",
+            description=f"HTTP flood: {threads} threads, randomized UA+path",
         )
         write_label(label)
         log.info(f"{self.name}: sent={sent} errors={errs}")
         return label
 
+    def _host(self) -> str:
+        return self.target.split("//")[-1].split("/")[0]
 
-# ---------------------------------------------------------------------------
-# Scenario 2 — Slowloris (low and slow)
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# 2. Slowloris
+# ===========================================================================
 
 class Slowloris(ScenarioBase):
     name = "slowloris"
 
     def run(self, duration: int = 60, connections: int = 100,
-            keepalive: float = 5.0) -> AttackLabel:
+            keepalive: float = 5.0, **kwargs) -> AttackLabel:
         self.reset()
         self._stop.clear()
 
@@ -238,20 +251,18 @@ class Slowloris(ScenarioBase):
         return label
 
 
-# ---------------------------------------------------------------------------
-# Scenario 3 — Ramping flood (gradual increase)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 3. Ramping flood
+# ===========================================================================
 
 class RampingFlood(ScenarioBase):
     name = "ramping_flood"
 
     def run(self, duration: int = 60, start_rps: float = 5.0,
-            end_rps: float = 200.0) -> AttackLabel:
-        """Gradually increase request rate over time. Tests temporal models."""
+            end_rps: float = 200.0, **kwargs) -> AttackLabel:
         self.reset()
         self._stop.clear()
         start = time.time()
-
         session = make_session(pool=20)
 
         while not self._stop.is_set() and (time.time() - start) < duration:
@@ -283,16 +294,16 @@ class RampingFlood(ScenarioBase):
         return label
 
 
-# ---------------------------------------------------------------------------
-# Scenario 4 — Bursty flood (on/off pattern)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 4. Bursty flood
+# ===========================================================================
 
 class BurstyFlood(ScenarioBase):
     name = "bursty_flood"
 
     def run(self, duration: int = 60, burst_duration: float = 3.0,
-            gap_duration: float = 3.0, threads: int = 20) -> AttackLabel:
-        """Alternates between bursts of attack and quiet periods."""
+            gap_duration: float = 3.0, threads: int = 20,
+            **kwargs) -> AttackLabel:
         self.reset()
         self._stop.clear()
         start = time.time()
@@ -307,14 +318,13 @@ class BurstyFlood(ScenarioBase):
                     self._inc(False)
 
         while not self._stop.is_set() and (time.time() - start) < duration:
-            # Burst phase
-            ws = [threading.Thread(target=burst_worker, daemon=True) for _ in range(threads)]
+            ws = [threading.Thread(target=burst_worker, daemon=True)
+                  for _ in range(threads)]
             for w in ws:
                 w.start()
             time.sleep(burst_duration)
 
-            # Gap phase
-            self._stop.set()    # tell workers to stop
+            self._stop.set()
             for w in ws:
                 w.join(timeout=1)
             self._stop.clear()
@@ -336,9 +346,9 @@ class BurstyFlood(ScenarioBase):
         return label
 
 
-# ---------------------------------------------------------------------------
-# Scenario 5 — Distributed (many "fake IPs" via X-Forwarded-For)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 5. Distributed (XFF spoofing)
+# ===========================================================================
 
 class DistributedFlood(ScenarioBase):
     name = "distributed"
@@ -352,8 +362,7 @@ class DistributedFlood(ScenarioBase):
         return ".".join(str(random.randint(1, 254)) for _ in range(4))
 
     def run(self, duration: int = 30, threads: int = 50,
-            ips_per_thread: int = 5) -> AttackLabel:
-        """Simulates many "fake" source IPs to mimic a botnet."""
+            **kwargs) -> AttackLabel:
         self.reset()
         self._stop.clear()
         start = time.time()
@@ -393,21 +402,19 @@ class DistributedFlood(ScenarioBase):
         return label
 
 
-# ---------------------------------------------------------------------------
-# Scenario 6 — Mixed (normal + attack blend)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 6. Mixed
+# ===========================================================================
 
 class MixedTraffic(ScenarioBase):
     name = "mixed"
 
     def run(self, duration: int = 60, normal_rps: float = 3.0,
-            attack_threads: int = 15) -> AttackLabel:
-        """Runs normal traffic AND attack concurrently — realistic."""
+            attack_threads: int = 15, **kwargs) -> AttackLabel:
         self.reset()
         self._stop.clear()
         start = time.time()
 
-        # Normal traffic thread (background, low rate)
         def normal_worker():
             session = make_session()
             interval = 1.0 / normal_rps
@@ -418,7 +425,6 @@ class MixedTraffic(ScenarioBase):
                     pass
                 time.sleep(interval)
 
-        # Attack threads
         def attack_worker():
             session = make_session(pool=10)
             while not self._stop.is_set() and (time.time() - start) < duration:
@@ -457,9 +463,105 @@ class MixedTraffic(ScenarioBase):
         return label
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 7. Dynamic / Rotating IP attack
+# ===========================================================================
+
+class DynamicIPAttack(ScenarioBase):
+    """Rotating IP attack via X-Forwarded-For.
+
+    Every request carries a DIFFERENT X-Forwarded-For header, so nginx
+    (which trusts XFF) logs a different source IP for every request.
+    No single IP sends more than 1 request.
+
+    Requires nginx: `real_ip_header X-Forwarded-For;`
+    """
+    name = "dynamic_ip"
+
+    IP_POOLS = [
+        "203.0.113",       # TEST-NET-3
+        "198.51.100",      # TEST-NET-2
+        "192.0.2",         # TEST-NET-1
+    ]
+
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "curl/8.5.0",
+        "python-requests/2.31.0",
+    ]
+
+    PATHS = [
+        "/", "/index.html", "/api/data", "/api/v1/users",
+        "/static/style.css", "/img/logo.png", "/favicon.ico",
+        "/health", "/products", "/about",
+    ]
+
+    def _random_ip(self) -> str:
+        pool = random.choice(self.IP_POOLS)
+        return f"{pool}.{random.randint(1, 254)}"
+
+    def run(self, duration: int = 30, threads: int = 50,
+            **kwargs) -> AttackLabel:
+        self.reset()
+        self._stop.clear()
+        start = time.time()
+
+        def worker(tid: int):
+            session = make_session(pool=5)
+            while not self._stop.is_set() and (time.time() - start) < duration:
+                try:
+                    fake_ip = self._random_ip()
+                    headers = {
+                        "X-Forwarded-For": fake_ip,
+                        "User-Agent": random.choice(self.USER_AGENTS),
+                        "Accept": "*/*",
+                        "Accept-Language": random.choice(
+                            ["en-US,en;q=0.9", "en-GB,en;q=0.8", "en;q=0.9"]
+                        ),
+                    }
+                    if random.random() < 0.3:
+                        headers["Referer"] = f"http://{fake_ip}/"
+
+                    path = random.choice(self.PATHS).lstrip("/")
+                    r = session.get(
+                        self.target + path,
+                        headers=headers,
+                        timeout=self.timeout,
+                    )
+                    self._inc(r.status_code < 500)
+                    time.sleep(random.uniform(0.001, 0.02))
+                except Exception:
+                    self._inc(False)
+
+        ws = [threading.Thread(target=worker, args=(i,), daemon=True)
+              for i in range(threads)]
+        for w in ws:
+            w.start()
+        for w in ws:
+            w.join(timeout=duration + 10)
+
+        sent, errs = self.snapshot()
+        label = AttackLabel(
+            scenario=self.name, phase="attack",
+            ts_start=start, ts_end=time.time(),
+            target=self.target,
+            source_ips=["<rotating XFF>"],
+            requests_sent=sent, errors=errs,
+            threads=threads, rps_target=0.0,
+            description=f"Dynamic IP: {threads} threads, rotating XFF",
+        )
+        write_label(label)
+        log.info(f"{self.name}: sent={sent} errors={errs}")
+        return label
+
+
+# ===========================================================================
 # Registry
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 SCENARIOS: dict[str, type[ScenarioBase]] = {
     "http_flood":      HTTPFlood,
@@ -468,8 +570,13 @@ SCENARIOS: dict[str, type[ScenarioBase]] = {
     "bursty_flood":    BurstyFlood,
     "distributed":     DistributedFlood,
     "mixed":           MixedTraffic,
+    "dynamic_ip":      DynamicIPAttack,
 }
 
+
+# ===========================================================================
+# CLI
+# ===========================================================================
 
 if __name__ == "__main__":
     import argparse
@@ -478,26 +585,19 @@ if __name__ == "__main__":
     p.add_argument("--scenario", required=True, choices=list(SCENARIOS.keys()))
     p.add_argument("--target", required=True)
     p.add_argument("--duration", type=int, default=30)
-    p.add_argument("--threads", type=int, default=30,
-                   help="threads (http_flood, distributed, bursty, mixed)")
-    p.add_argument("--connections", type=int, default=100,
-                   help="connections (slowloris only)")
-    p.add_argument("--keepalive", type=float, default=5.0,
-                   help="keepalive seconds (slowloris only)")
-    p.add_argument("--spoof", action="store_true",
-                   help="spoof X-Forwarded-For (distributed only)")
+    p.add_argument("--threads", type=int, default=30)
+    p.add_argument("--connections", type=int, default=100)
+    p.add_argument("--keepalive", type=float, default=5.0)
+    p.add_argument("--spoof", action="store_true")
     args = p.parse_args()
 
     cls = SCENARIOS[args.scenario]
     sim = cls(args.target)
 
-    # Pass the right kwargs based on scenario type
     if args.scenario == "slowloris":
-        label = sim.run(
-            duration=args.duration,
-            connections=args.connections,
-            keepalive=args.keepalive,
-        )
+        label = sim.run(duration=args.duration,
+                        connections=args.connections,
+                        keepalive=args.keepalive)
     elif args.scenario == "distributed":
         sim.spoof_xff = args.spoof
         label = sim.run(duration=args.duration, threads=args.threads)
@@ -507,7 +607,7 @@ if __name__ == "__main__":
         label = sim.run(duration=args.duration, attack_threads=args.threads)
     elif args.scenario == "ramping_flood":
         label = sim.run(duration=args.duration)
-    else:   # http_flood
+    else:
         label = sim.run(duration=args.duration, threads=args.threads)
 
     print()
