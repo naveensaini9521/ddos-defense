@@ -1,20 +1,12 @@
-"""HTTP traffic generator (normal + attack modes)."""
-# TODO: implement using requests / aiohttp
 """
 simulator/traffic_generator.py
 
 Generates HTTP traffic against a target — normal or attack mode.
 
-Usage (as library):
-    from simulator.traffic_generator import TrafficGenerator
-
-    gen = TrafficGenerator(target="http://192.168.100.10/")
-    gen.run_normal(duration=30, rps=5)
-    gen.run_http_flood(duration=30, threads=50)
-
 Usage (CLI):
-    python -m simulator.traffic_generator --target http://192.168.100.10/ \
-        --mode normal --duration 30 --rps 5
+    python -m simulator.traffic_generator \\
+        --target http://192.168.122.30:8080/ \\
+        --mode normal --duration 15 --rps 3
 """
 from __future__ import annotations
 
@@ -24,7 +16,7 @@ import random
 import socket
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -35,24 +27,21 @@ from core.logging import get_logger
 
 log = get_logger("simulator.traffic_generator")
 
-Mode = Literal["normal", "http_flood", "slowloris", "spoofed"]
+Mode = Literal["normal", "http_flood", "spoofed", "slowloris"]
 
-# Where labels go — matched to your scaffold
 LABEL_DIR = Path("data/labeled")
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Ground-truth label
 # ---------------------------------------------------------------------------
-
 @dataclass
 class TrafficLabel:
-    """Ground-truth label emitted alongside generated traffic."""
     ts_start: float
     ts_end: float
     mode: str
     target: str
-    source_ip: str          # "spoofed" if rotated, else real client IP
+    source_ip: str
     requests: int
     threads: int
     rps_target: float
@@ -60,16 +49,13 @@ class TrafficLabel:
 
 
 # ---------------------------------------------------------------------------
-# Utilities
+# Helpers
 # ---------------------------------------------------------------------------
-
 def random_ip() -> str:
-    """Random public-looking IPv4 (for X-Forwarded-For spoofing)."""
     return ".".join(str(random.randint(1, 254)) for _ in range(4))
 
 
 def real_source_ip(target: str) -> str:
-    """Best-effort local IP used to reach the target."""
     try:
         host = target.split("//")[-1].split("/")[0].split(":")[0]
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -82,7 +68,6 @@ def real_source_ip(target: str) -> str:
 
 
 def make_session(pool: int = 100) -> requests.Session:
-    """Session with a large connection pool."""
     s = requests.Session()
     adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool, max_retries=0)
     s.mount("http://", adapter)
@@ -101,7 +86,6 @@ def write_label(label: TrafficLabel) -> None:
 # ---------------------------------------------------------------------------
 # Traffic Generator
 # ---------------------------------------------------------------------------
-
 class TrafficGenerator:
     def __init__(
         self,
@@ -117,19 +101,14 @@ class TrafficGenerator:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0",
             "curl/8.4.0",
             "python-requests/2.31.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
         ]
         self.paths = paths or ["/", "/index.html", "/api/data", "/health"]
 
-        # counters (thread-safe with lock)
         self._lock = threading.Lock()
         self._sent = 0
         self._errors = 0
         self._stop = threading.Event()
 
-    # ------------------------------------------------------------------
-    # counters
-    # ------------------------------------------------------------------
     def _inc(self, ok: bool) -> None:
         with self._lock:
             self._sent += 1
@@ -145,23 +124,20 @@ class TrafficGenerator:
             self._sent = 0
             self._errors = 0
 
-    # ------------------------------------------------------------------
-    # normal traffic
-    # ------------------------------------------------------------------
+    def stop(self) -> None:
+        self._stop.set()
+
+    # --- normal ---
     def run_normal(self, duration: int = 30, rps: float = 5.0,
                    jitter: float = 0.3) -> TrafficLabel:
-        """
-        Realistic user traffic: a fixed request rate with jitter,
-        rotating paths + user-agents.
-        """
         log.info(f"[normal] target={self.target} rps={rps} dur={duration}s")
         self.reset()
         self._stop.clear()
 
         start = time.time()
         interval = 1.0 / max(rps, 0.001)
-
         session = make_session()
+
         while not self._stop.is_set() and (time.time() - start) < duration:
             try:
                 path = random.choice(self.paths)
@@ -171,8 +147,6 @@ class TrafficGenerator:
                 self._inc(r.status_code < 500)
             except Exception:
                 self._inc(False)
-
-            # jittered sleep
             time.sleep(interval * (1 + random.uniform(-jitter, jitter)))
 
         sent, errs = self.snapshot()
@@ -186,19 +160,12 @@ class TrafficGenerator:
         write_label(label)
         return label
 
-    # ------------------------------------------------------------------
-    # HTTP flood (L7 — volumetric)
-    # ------------------------------------------------------------------
+    # --- http flood ---
     def run_http_flood(self, duration: int = 30, threads: int = 50,
                        spoof_xff: bool = False) -> TrafficLabel:
-        """
-        Volumetric HTTP flood. Optionally rotates X-Forwarded-For
-        to simulate IP cloaking at the proxy layer.
-        """
         log.info(f"[http_flood] threads={threads} dur={duration}s spoof_xff={spoof_xff}")
         self.reset()
         self._stop.clear()
-
         start = time.time()
 
         def worker(tid: int) -> None:
@@ -231,15 +198,9 @@ class TrafficGenerator:
         write_label(label)
         return label
 
-    # ------------------------------------------------------------------
-    # Slowloris (L7 — low and slow)
-    # ------------------------------------------------------------------
+    # --- slowloris ---
     def run_slowloris(self, duration: int = 60, connections: int = 200,
                       keepalive: float = 10.0) -> TrafficLabel:
-        """
-        Opens many sockets, sends partial HTTP headers, keeps them open.
-        Low bandwidth — evades rate limiting but exhausts connection tables.
-        """
         log.info(f"[slowloris] conns={connections} dur={duration}s")
         self.reset()
         self._stop.clear()
@@ -268,13 +229,11 @@ class TrafficGenerator:
                 self._inc(False)
                 return None
 
-        # open connections
         for _ in range(connections):
             s = open_conn()
             if s:
                 sockets.append(s)
 
-        # keep them alive with partial headers
         while not self._stop.is_set() and (time.time() - start) < duration:
             for s in list(sockets):
                 try:
@@ -283,7 +242,6 @@ class TrafficGenerator:
                 except Exception:
                     self._inc(False)
                     sockets.remove(s)
-                    # try to replace
                     ns = open_conn()
                     if ns:
                         sockets.append(ns)
@@ -306,27 +264,20 @@ class TrafficGenerator:
         write_label(label)
         return label
 
-    # ------------------------------------------------------------------
-    # stop hook (for Ctrl-C)
-    # ------------------------------------------------------------------
-    def stop(self) -> None:
-        self._stop.set()
-
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="HTTP traffic simulator (normal + attacks)")
-    p.add_argument("--target", required=True, help="e.g. http://192.168.100.10/")
+    p = argparse.ArgumentParser(description="HTTP traffic simulator")
+    p.add_argument("--target", required=True)
     p.add_argument("--mode", required=True,
-                   choices=["normal", "http_flood", "slowloris", "spoofed"])
+                   choices=["normal", "http_flood", "spoofed", "slowloris"])
     p.add_argument("--duration", type=int, default=30)
-    p.add_argument("--rps", type=float, default=5.0, help="for normal mode")
-    p.add_argument("--threads", type=int, default=50, help="for http_flood")
-    p.add_argument("--connections", type=int, default=200, help="for slowloris")
-    p.add_argument("--keepalive", type=float, default=10.0, help="for slowloris")
+    p.add_argument("--rps", type=float, default=5.0)
+    p.add_argument("--threads", type=int, default=50)
+    p.add_argument("--connections", type=int, default=200)
+    p.add_argument("--keepalive", type=float, default=10.0)
     return p.parse_args()
 
 
