@@ -1,4 +1,7 @@
-"""Consistent JSON logging across modules."""
+"""
+Consistent JSON logging across all modules.
+Every module does: from core.logging import get_logger
+"""
 from __future__ import annotations
 
 import json
@@ -8,7 +11,9 @@ import time
 
 
 class JsonFormatter(logging.Formatter):
-    def format(self, record):
+    """Emit one JSON object per log line — easy to grep, parse, ship."""
+
+    def format(self, record: logging.LogRecord) -> str:
         payload = {
             "ts": time.time(),
             "level": record.levelname,
@@ -20,11 +25,13 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload)
 
 
-def get_logger(name: str) -> logging.Logger:
+def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+    """Return a logger writing JSON to stdout, configured once."""
     log = logging.getLogger(name)
     if not log.handlers:
         h = logging.StreamHandler(sys.stdout)
         h.setFormatter(JsonFormatter())
         log.addHandler(h)
-        log.setLevel(logging.INFO)
+        log.setLevel(level)
+        log.propagate = False
     return log
