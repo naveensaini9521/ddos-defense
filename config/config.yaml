@@ -5,19 +5,67 @@ app:
 collector:
   window_seconds: 10
   source: nginx
+  log_path: /var/log/nginx/access.log # ← default path
+  remote_log: true
+  remote_host: naveen@192.168.122.30
+  use_sudo: false # ← no sudo
+  max_age: 3600
 
 ml:
-  model_path: ml/models/v1.pkl
+  model_path: ml/models/v1_xgb.pkl
+  ensemble:
+    iso_path: ml/models/v1_iso.pkl
+    rf_path: ml/models/v1_rf.pkl
+    xgb_path: ml/models/v1_xgb.pkl
   threshold: 0.7
+  weights:
+    v1_iso: 0.20
+    v1_rf: 0.35
+    v1_xgb: 0.45
 
 blocker:
-  backend: iptables     # iptables | nftables | null
+  backend: iptables
+  chain: INPUT
+  rule_target: DROP
+  dry_run: true # ← SAFE MODE while testing
+  remote_host: naveen@192.168.122.30
+  remote_sudo: true
+  use_sudo: true
+
   default_ttl: 60
-  backoff:
+  backoff_seconds:
     - 60
     - 300
     - 1800
+    - 86400
+  permanent_after_strike: 5
+  max_ttl: 86400
+
+  expiry_check_interval: 5.0
+  auto_purge: true
+
+  whitelist:
+    - 127.0.0.1
+    - 192.168.122.1
+    - 192.168.122.30
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
 
 api:
   host: 0.0.0.0
   port: 8000
+
+simulator:
+  default_target: http://192.168.122.30/
+  default_rps: 5.0
+  default_duration: 30
+
+pipeline:
+  window_seconds: 10
+  mode: live # live | once | dry-run
+  dynamic_ip:
+    enabled: true
+    subnet_size: 24
+    new_ip_threshold: 20
+    churn_threshold: 0.5
