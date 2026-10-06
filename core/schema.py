@@ -1,13 +1,11 @@
-"""
-Single source of truth for feature names, constants, and shared types.
-Every module imports from here to prevent schema drift.
-"""
+"""Single source of truth for feature names, constants, and shared types."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
 
-# --- Feature schema (order matters — used as ML input vector) ---
+
+# 12 features (was 9)
 FEATURE_NAMES: list[str] = [
     "pkt_rate",
     "byte_rate",
@@ -18,6 +16,9 @@ FEATURE_NAMES: list[str] = [
     "http_reqs",
     "error_ratio",
     "src_ip_entropy",
+    "ua_entropy",
+    "path_concentration",
+    "time_regularity",
 ]
 
 
