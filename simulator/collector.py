@@ -27,8 +27,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from collector.nginx_parser import ParsedLog, parse_line
 from core.logging import get_logger
+from pipeline.live_collector import LiveCollector
 from simulator.attack_scenarios import SCENARIOS
 
 log = get_logger("simulator.collector")
@@ -55,103 +55,6 @@ class CollectedRecord:
 
     def to_dict(self) -> dict:
         return asdict(self)
-
-
-# ---------------------------------------------------------------------------
-# Remote log tailer (SSH)
-# ---------------------------------------------------------------------------
-
-class RemoteLogCollector:
-    def __init__(self, host: str, log_path: str = "/var/log/nginx/access.log",
-                 use_sudo: bool = False) -> None:
-        self.host = host
-        self.log_path = log_path
-        self.use_sudo = use_sudo
-        self.records: list[ParsedLog] = []
-        self.raw_lines: list[str] = []
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._proc: subprocess.Popen | None = None
-        self._lock = threading.Lock()
-
-    def start(self) -> None:
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        log.info(f"log collector started → {self.host}:{self.log_path}")
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=2)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-        if self._thread:
-            self._thread.join(timeout=5)
-        log.info(f"log collector stopped: {len(self.records)} records")
-
-    def count(self) -> int:
-        with self._lock:
-            return len(self.records)
-
-    def _loop(self) -> None:
-        path = self.log_path if self.log_path.startswith("/") else "/" + self.log_path
-        tail_cmd = f"tail -F -n 0 {shlex.quote(path)}"
-        if self.use_sudo:
-            tail_cmd = f"sudo -n {tail_cmd}"
-        remote_cmd = f"stdbuf -oL -eL {tail_cmd}"
-
-        cmd = [
-            "ssh", "-T",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
-            self.host, remote_cmd,
-        ]
-
-        self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            bufsize=0, universal_newlines=False,
-        )
-
-        def drain():
-            p = self._proc
-            if p and p.stderr:
-                for _ in iter(p.stderr.readline, b""):
-                    pass
-        threading.Thread(target=drain, daemon=True).start()
-
-        try:
-            p = self._proc
-            if p is None or p.stdout is None:
-                return
-            while not self._stop.is_set():
-                raw = p.stdout.readline()
-                if not raw:
-                    break
-                try:
-                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                except Exception:
-                    continue
-                if not line.strip():
-                    continue
-                with self._lock:
-                    self.raw_lines.append(line)
-                    rec = parse_line(line)
-                    if rec:
-                        self.records.append(rec)
-        finally:
-            if self._proc and self._proc.poll() is None:
-                try:
-                    self._proc.terminate()
-                except Exception:
-                    pass
-            self._proc = None
 
 
 # ---------------------------------------------------------------------------
@@ -192,50 +95,44 @@ class NormalTrafficGenerator:
 
 
 # ---------------------------------------------------------------------------
-# Main collector
+# Drain helper — works with LiveCollector
 # ---------------------------------------------------------------------------
 
 def drain_wait(
-    log_col: RemoteLogCollector,
+    lc: LiveCollector,
     quiet_seconds: float = 2.0,
     max_wait: float = 30.0,
 ) -> int:
-    """Wait until the SSH tail stops producing new records.
+    """Wait until the collector stops producing new records.
 
-    Uses a "quiet period" heuristic: if no new records arrive for
+    Uses a quiet-period heuristic: if no new records arrive for
     `quiet_seconds`, assume we've caught up. Capped by `max_wait`.
 
-    Returns the final record count.
+    Returns the final parsed-record count.
     """
     start = time.time()
-    last_count = log_col.count()
+    last_count = lc.stats()["total_parsed"]
     last_change = time.time()
 
     while (time.time() - start) < max_wait:
         time.sleep(0.2)
-        current = log_col.count()
+        current = lc.stats()["total_parsed"]
         if current != last_count:
             last_count = current
             last_change = time.time()
         elif (time.time() - last_change) >= quiet_seconds:
-            # quiet for long enough — we're drained
             break
 
-    return log_col.count()
+    return lc.stats()["total_parsed"]
+
+
+# ---------------------------------------------------------------------------
+# Remote tcpdump
+# ---------------------------------------------------------------------------
 
 def remote_tcpdump(host: str, action: str, pcap_path: str,
                    timeout: float = 15.0) -> tuple[bool, str]:
-    """Control tcpdump on the remote via the controller script.
-
-    Args:
-        host: ssh target (user@ip)
-        action: "start" | "stop" | "status"
-        pcap_path: remote path for the pcap file
-        timeout: SSH command timeout
-
-    Returns:
-        (ok, message)
-    """
+    """Control tcpdump on the remote via the controller script."""
     cmd = (
         f"sudo -n /usr/local/bin/tcpdump_control {action} "
         f"{shlex.quote(pcap_path)}"
@@ -273,6 +170,11 @@ def remote_copy_pcap(host: str, remote_path: str,
     except Exception:
         return False
 
+
+# ---------------------------------------------------------------------------
+# Main collector
+# ---------------------------------------------------------------------------
+
 def collect_scenario(
     scenario: str,
     target: str,
@@ -280,7 +182,7 @@ def collect_scenario(
     duration: int = 30,
     warmup: int = 5,
     cooldown: int = 5,
-    vm_log_path: str = "/var/log/nginx/access.log",
+    vm_log_path: str = "/var/log/nginx/ddos_access.log",
     scenario_kwargs: dict | None = None,
     normal_rps: float = 3.0,
     capture_packets: bool = True,
@@ -288,28 +190,27 @@ def collect_scenario(
     """Run one scenario and collect labeled records.
 
     Labels are assigned by INDEX position in the collected stream:
-        - Records 0..warmup_end_idx            → normal  (warmup)
+        - Records 0..warmup_end_idx              → normal  (warmup)
         - Records warmup_end_idx..attack_end_idx → attack
-        - Records attack_end_idx..end          → normal  (cooldown)
+        - Records attack_end_idx..end            → normal  (cooldown)
 
     This avoids clock skew between host and VM.
     """
     if scenario not in SCENARIOS:
         raise ValueError(f"unknown scenario: {scenario}")
-    
+
     COLLECTED_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = COLLECTED_DIR / f"{timestamp}_{scenario}"
-    
+
     log.info(f"=== collecting: {scenario} ===")
     log.info(f"  target:   {target}")
     log.info(f"  vm_host:  {vm_host}")
     log.info(f"  duration: warmup={warmup}s attack={duration}s cooldown={cooldown}s")
     log.info(f"  packet capture: {capture_packets}")
 
-    # 0. Start tcpdump on the VM (if enabled)
+    # 0. tcpdump on the VM
     remote_pcap = f"/tmp/{timestamp}_{scenario}.pcap"
-    
     tcpdump_started = False
     if capture_packets:
         ok, msg = remote_tcpdump(vm_host, "start", remote_pcap)
@@ -319,23 +220,23 @@ def collect_scenario(
         else:
             log.warning(f"tcpdump failed to start: {msg}")
 
-    # 1. Start SSH log tailer
-    log_col = RemoteLogCollector(vm_host, vm_log_path)
-    log_col.start()
+    # 1. Start LiveCollector (PTY-based SSH tail)
+    lc = LiveCollector(f"ssh://{vm_host}{vm_log_path}")
+    lc.start()
+    time.sleep(2)   # let SSH+PTY establish
 
     # 2. Start normal traffic generator
     normal_gen = NormalTrafficGenerator(target, rps=normal_rps)
     normal_gen.start()
 
-    # 3. Warmup phase
+    # 3. Warmup
     log.info(f"phase 1: warmup ({warmup}s)")
     time.sleep(warmup)
-    # Wait for tail to catch up (no new records for 1s)
-    drain_wait(log_col, quiet_seconds=1.0, max_wait=10.0)
-    warmup_end_idx = log_col.count()
+    drain_wait(lc, quiet_seconds=1.0, max_wait=10.0)
+    warmup_end_idx = lc.stats()["total_parsed"]
     log.info(f"  warmup ended: {warmup_end_idx} records collected")
 
-    # 4. Attack phase
+    # 4. Attack
     log.info(f"phase 2: attack ({duration}s of {scenario})")
     sim = SCENARIOS[scenario](target)
     kwargs = dict(scenario_kwargs or {})
@@ -349,24 +250,17 @@ def collect_scenario(
 
     sim.run(**kwargs)
 
-    # CRITICAL: wait for SSH tail to drain all attack traffic
     log.info("  waiting for collector to drain attack traffic...")
-    drain_wait(log_col, quiet_seconds=2.0, max_wait=30.0)
-    attack_end_idx = log_col.count()
+    drain_wait(lc, quiet_seconds=2.0, max_wait=30.0)
+    attack_end_idx = lc.stats()["total_parsed"]
     log.info(f"  attack ended: {attack_end_idx} records collected "
              f"({attack_end_idx - warmup_end_idx} attack)")
 
-    # 5. Cooldown phase
+    # 5. Cooldown
     log.info(f"phase 3: cooldown ({cooldown}s)")
     time.sleep(cooldown)
-    drain_wait(log_col, quiet_seconds=1.0, max_wait=10.0)
-    cooldown_end_idx = log_col.count()
-    log.info(f"  cooldown ended: {cooldown_end_idx} records collected "
-             f"({cooldown_end_idx - attack_end_idx} normal)")
-    # 5. Cooldown phase
-    log.info(f"phase 3: cooldown ({cooldown}s)")
-    time.sleep(cooldown)
-    cooldown_end_idx = log_col.count()
+    drain_wait(lc, quiet_seconds=1.0, max_wait=10.0)
+    cooldown_end_idx = lc.stats()["total_parsed"]
     log.info(f"  cooldown ended: {cooldown_end_idx} records collected "
              f"({cooldown_end_idx - attack_end_idx} normal)")
 
@@ -374,7 +268,7 @@ def collect_scenario(
     normal_gen.stop()
     time.sleep(0.5)
 
-    # 7. Stop tcpdump and copy pcap
+    # 7. Stop tcpdump, copy pcap
     pcap_local: Path | None = None
     if tcpdump_started:
         ok, msg = remote_tcpdump(vm_host, "stop", remote_pcap)
@@ -389,20 +283,18 @@ def collect_scenario(
         else:
             log.warning(f"tcpdump stop failed: {msg}")
 
-    # 8. Stop log tailer
-    log_col.stop()
+    # 8. Snapshot records + stop collector
+    all_records = lc.all_records()
+    lc.stop()
 
-    # 7. Label by INDEX position
+    # 9. Label by INDEX position
     log.info("labeling records by index position...")
-    records = log_col.records
-    total = len(records)
-
-    # Clamp boundaries to actual record count
+    total = len(all_records)
     warmup_end_idx = min(warmup_end_idx, total)
     attack_end_idx = min(attack_end_idx, total)
 
     labeled: list[CollectedRecord] = []
-    for i, rec in enumerate(records):
+    for i, rec in enumerate(all_records):
         if i < warmup_end_idx:
             phase, label = "warmup", 0
         elif i < attack_end_idx:
@@ -426,9 +318,9 @@ def collect_scenario(
     n_attack = sum(1 for r in labeled if r.label == 1)
     n_normal = len(labeled) - n_attack
 
-    # 8. Write outputs
+    # 10. Write outputs
     raw_path = base.with_suffix(".log")
-    raw_path.write_text("\n".join(log_col.raw_lines))
+    raw_path.write_text("\n".join(r.raw for r in all_records))
 
     meta = {
         "scenario": scenario,
@@ -447,7 +339,7 @@ def collect_scenario(
         "pcap_captured": pcap_local is not None,
         "pcap_path": str(pcap_local) if pcap_local else None,
     }
-    
+
     meta_path = base.with_suffix(".meta.json")
     meta_path.write_text(json.dumps(meta, indent=2))
 
@@ -463,7 +355,7 @@ def collect_scenario(
     if pcap_local:
         log.info(f"   pcap:   {pcap_local}")
     log.info(f"   total={total}  attack={n_attack}  normal={n_normal}")
-    
+
     return jsonl_path
 
 
