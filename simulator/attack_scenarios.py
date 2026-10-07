@@ -10,7 +10,7 @@ Scenarios:
     - bursty_flood     : On/off bursts (tests burst detection)
     - distributed      : XFF spoofing (botnet simulation)
     - mixed            : Normal traffic + attack blend
-    - dynamic_ip       : Rotating IPs, 1 request per IP
+    - dynamic_ip       : Rotating IPs, weighted toward one ASN (realistic)
 """
 from __future__ import annotations
 
@@ -468,21 +468,28 @@ class MixedTraffic(ScenarioBase):
 # ===========================================================================
 
 class DynamicIPAttack(ScenarioBase):
-    """Rotating IP attack via X-Forwarded-For.
+    """Rotating IP attack via X-Forwarded-For with weighted ASN distribution.
 
     Every request carries a DIFFERENT X-Forwarded-For header, so nginx
-    (which trusts XFF) logs a different source IP for every request.
-    No single IP sends more than 1 request.
+    logs a different source IP for every request.
+
+    The IP pools are weighted so ~90% of traffic comes from a single
+    /24 (simulating a NordVPN-style single-ASN attack). The remaining
+    10% comes from two other datacenter /24s. This models realistic
+    attacker behavior: one primary botnet + a small diversification.
 
     Requires nginx: `real_ip_header X-Forwarded-For;`
     """
     name = "dynamic_ip"
 
     IP_POOLS = [
-        "203.0.113",       # TEST-NET-3
-        "198.51.100",      # TEST-NET-2
-        "192.0.2",         # TEST-NET-1
+        "203.0.113",       # TEST-NET-3 (curated → ASN 9009, M247)
+        "198.51.100",      # TEST-NET-2 (curated → ASN 16509, AWS)
+        "192.0.2",         # TEST-NET-1 (curated → ASN 14061, DigitalOcean)
     ]
+
+    # Weighted so 90% comes from the primary pool (ASN 9009)
+    IP_POOL_WEIGHTS = [0.90, 0.05, 0.05]
 
     USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -501,7 +508,8 @@ class DynamicIPAttack(ScenarioBase):
     ]
 
     def _random_ip(self) -> str:
-        pool = random.choice(self.IP_POOLS)
+        """Return a spoofed IP with weighted pool selection."""
+        pool = random.choices(self.IP_POOLS, weights=self.IP_POOL_WEIGHTS)[0]
         return f"{pool}.{random.randint(1, 254)}"
 
     def run(self, duration: int = 30, threads: int = 50,
@@ -549,10 +557,11 @@ class DynamicIPAttack(ScenarioBase):
             scenario=self.name, phase="attack",
             ts_start=start, ts_end=time.time(),
             target=self.target,
-            source_ips=["<rotating XFF>"],
+            source_ips=["<rotating XFF, weighted>"],
             requests_sent=sent, errors=errs,
             threads=threads, rps_target=0.0,
-            description=f"Dynamic IP: {threads} threads, rotating XFF",
+            description=f"Dynamic IP: {threads} threads, "
+                        f"90% from primary ASN pool",
         )
         write_label(label)
         log.info(f"{self.name}: sent={sent} errors={errs}")
