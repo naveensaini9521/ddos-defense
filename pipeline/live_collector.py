@@ -87,7 +87,7 @@ def build_command(spec: SourceSpec, use_sudo: bool = False) -> list[str]:
             tail_cmd = f"sudo -n {tail_cmd}"
         # -tt forces PTY allocation; no stdbuf needed when we have a PTY
         return [
-            "ssh", "-tt",
+            "ssh", "-T",
             "-o", "StrictHostKeyChecking=no",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=3",
