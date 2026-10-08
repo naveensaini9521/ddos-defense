@@ -11,7 +11,7 @@ Usage:
     from blocker.whitelist import Whitelist
 
     wl = Whitelist()
-    wl.add_ip("192.168.122.1")
+    # wl.add_ip("192.168.122.1")
     wl.add_network("10.0.0.0/24")
 
     if wl.is_whitelisted("192.168.122.1"):
