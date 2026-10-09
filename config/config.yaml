@@ -2,35 +2,42 @@ app:
   name: ddos-defense
   log_level: INFO
 
+redis:
+  host: localhost
+  port: 6379
+  db: 0
+  prefix: "ddos:"
+
 collector:
   window_seconds: 10
   source: nginx
-  log_path: /var/log/nginx/access.log # ← default path
+  log_path: /var/log/nginx/ddos_access.log
   remote_log: true
   remote_host: naveen@192.168.122.30
   use_sudo: false # ← no sudo
   max_age: 3600
 
 ml:
-  model_path: ml/models/v1_xgb.pkl
+  model_path: ml/models/v11_xgb.pkl
   ensemble:
-    iso_path: ml/models/v1_iso.pkl
-    rf_path: ml/models/v1_rf.pkl
-    xgb_path: ml/models/v1_xgb.pkl
+    iso_path: ml/models/v11_iso.pkl
+    rf_path: ml/models/v11_rf.pkl
+    xgb_path: ml/models/v11_xgb.pkl
   threshold: 0.7
   weights:
-    v1_iso: 0.20
-    v1_rf: 0.35
-    v1_xgb: 0.45
+    iso: 0.20
+    rf: 0.35
+    xgb: 0.45
 
 blocker:
   backend: iptables
   chain: INPUT
   rule_target: DROP
-  dry_run: true # ← SAFE MODE while testing
+  dry_run: false # ← SAFE MODE while testing
   remote_host: naveen@192.168.122.30
   remote_sudo: true
   use_sudo: true
+  use_ipset: true
 
   default_ttl: 60
   backoff_seconds:
@@ -40,17 +47,19 @@ blocker:
     - 86400
   permanent_after_strike: 5
   max_ttl: 86400
+  max_asn_prefixes: 5000
+  asn_db_path: data/ipasn.dat
 
   expiry_check_interval: 5.0
   auto_purge: true
 
   whitelist:
     - 127.0.0.1
-    - 192.168.122.1
+    # - 192.168.122.1
     - 192.168.122.30
-    - 10.0.0.0/8
-    - 172.16.0.0/12
-    - 192.168.0.0/16
+    # - 10.0.0.0/8
+    # - 172.16.0.0/12
+    # - 192.168.0.0/16
 
 api:
   host: 0.0.0.0
