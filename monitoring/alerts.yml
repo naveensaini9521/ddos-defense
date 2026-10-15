@@ -1,10 +1,116 @@
+# Prometheus alert rules for DDoS defense
+# Load with: prometheus --config.file=... rule_files: [alerts.yml]
 groups:
-  - name: ddos
+  - name: ddos-defense
+    interval: 15s
     rules:
-      - alert: HighAttackRate
-        expr: ddos_attack_probability > 0.7
-        for: 10s
+      # -----------------------------------------------------------------
+      # Attack detection
+      # -----------------------------------------------------------------
+      - alert: HighBlockRate
+        expr: rate(ddos_blocks_total[1m]) > 10
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "High block rate: {{ $value }} blocks/sec"
+          description: "The system is blocking > 10 IPs/sec — active attack"
+
+      - alert: VeryHighBlockRate
+        expr: rate(ddos_blocks_total[1m]) > 50
+        for: 15s
         labels:
           severity: critical
         annotations:
-          summary: "High attack probability detected"
+          summary: "Very high block rate: {{ $value }} blocks/sec"
+          description: "Aggressive blocking in progress — likely large-scale attack"
+
+      - alert: ManyActiveBlocks
+        expr: ddos_active_blocks > 100
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} IPs currently blocked"
+          description: "Sustained high block count — check if legitimate traffic is affected"
+
+      - alert: PermanentBlocksGrowing
+        expr: increase(ddos_permanent_blocks[1h]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} permanent blocks added in the last hour"
+          description: "Repeat offenders — investigate for coordinated attack"
+
+      # -----------------------------------------------------------------
+      # System health
+      # -----------------------------------------------------------------
+      - alert: CollectorDisconnected
+        expr: ddos_collector_connected == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Collector is disconnected from the VM"
+          description: "The pipeline cannot see incoming traffic — defense is blind"
+
+      - alert: HighPipelineLatency
+        expr: histogram_quantile(0.95, rate(ddos_tick_latency_seconds_bucket[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 tick latency is {{ $value }}s"
+          description: "Pipeline is slow — could miss attacks in real time"
+
+      - alert: PipelineErrors
+        expr: rate(ddos_errors_total[5m]) > 0.1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline errors at {{ $value }}/sec"
+          description: "Check logs for component={{ $labels.component }}"
+
+      - alert: CollectorBufferDraining
+        expr: ddos_collector_buffer_size < 10
+        for: 2m
+        labels:
+          severity: info
+        annotations:
+          summary: "Collector buffer is very low"
+          description: "Little traffic — either quiet or VM logging broken"
+
+      # -----------------------------------------------------------------
+      # Whitelist / safety
+      # -----------------------------------------------------------------
+      - alert: TooManyWhitelistSkips
+        expr: rate(ddos_whitelist_skips_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $value }} whitelist skips/sec"
+          description: "Attacker may be spoofing a whitelisted IP range"
+
+      # -----------------------------------------------------------------
+      # Model health
+      # -----------------------------------------------------------------
+      - alert: EnsembleUncertain
+        expr: ddos_attack_probability{model="ensemble"} > 0.6 and ddos_attack_probability{model="ensemble"} < 0.8
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Ensemble stuck in uncertain zone"
+          description: "Model can't decide — consider retraining or threshold tuning"
+
+      - alert: HighConfidenceAttacks
+        expr: avg_over_time(ddos_attack_probability{model="ensemble"}[5m]) > 0.9
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sustained high-confidence attack detection"
+          description: "Model is very confident there's an attack — verify it's not a false positive"
