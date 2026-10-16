@@ -4,8 +4,8 @@ An end-to-end, ML-powered DDoS detection and mitigation system. Runs on a
 controller host, tails logs from a remote VM, uses an ensemble of ML models
 to detect attacks in real time, and enforces iptables rules on the VM.
 
-Built for learning how real-world DDoS defense works — from raw logs to
-subnet-level blocking.
+Handles both **single-IP floods** (per-IP ML) and **rotating-IP botnets**
+(ASN/subnet detection via ipset).
 
 ---
 
@@ -14,41 +14,48 @@ subnet-level blocking.
 1. [What It Does](#what-it-does)
 2. [Architecture](#architecture)
 3. [Quick Start](#quick-start)
-4. [Installation](#installation)
-5. [Running](#running)
-6. [Components](#components)
-7. [Attack Types Detected](#attack-types-detected)
-8. [Configuration](#configuration)
-9. [Testing](#testing)
-10. [Monitoring](#monitoring)
-11. [Troubleshooting](#troubleshooting)
-12. [Project Structure](#project-structure)
+4. [VM Setup (Victim)](#vm-setup-victim)
+5. [Controller Setup](#controller-setup)
+6. [Running the System](#running-the-system)
+7. [Testing Dynamic IP Blocking](#testing-dynamic-ip-blocking)
+8. [Docker Deployment](#docker-deployment)
+9. [Monitoring](#monitoring)
+10. [Attack Scenarios](#attack-scenarios)
+11. [Configuration Reference](#configuration-reference)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## What It Does
 
-Given a target server (VM) and a controller host:
+Given a **victim VM** (target) and a **controller host**:
 
-1. **Collects logs** — tails nginx access logs from the VM via SSH
-2. **Extracts features** — turns raw log lines into per-IP feature vectors
-3. **Detects attacks** — using an ensemble of 3 ML models (IsolationForest, RandomForest, XGBoost)
-4. **Detects botnets** — using global features + subnet analysis
-5. **Enforces blocks** — applies iptables DROP rules on the VM via SSH
-6. **Auto-unblocks** — TTL + exponential backoff for repeat offenders
-7. **Exposes metrics** — Prometheus endpoint + alert rules
-8. **Provides API** — HTTP control plane for querying and manual actions
+1. **Collects logs** — tails nginx access logs from the VM via SSH (with PTY
+   for correct line buffering)
+2. **Enriches each IP** — subnet (/24), ASN (via pyasn), ASN type
+   (datacenter/mobile/residential)
+3. **Extracts features** — 12 HTTP features per IP per window
+4. **Detects attacks** — ensemble of 3 ML models (Iso + RF + XGB) for per-IP
+5. **Detects botnets** — subnet concentration, ASN concentration,
+   datacenter-share, new-IP rate
+6. **Enforces blocks** — iptables on the VM (single IP) or ipset
+   (entire ASN in one rule)
+7. **Auto-unblocks** — Redis native TTL + exponential backoff
+8. **Exposes metrics** — Prometheus endpoint + Grafana dashboards + alerts
+9. **Provides API** — FastAPI control plane for queries and manual actions
 
 ### Key Features
 
-- **Ensemble ML** — 3 models vote (Iso + RF + XGB) for high accuracy
-- **Handles dynamic IPs** — detects and blocks rotating botnets by subnet
-- **Safety first** — whitelist prevents locking yourself out
-- **Persistent** — survives restarts (SQLite)
-- **Explainable** — SHAP values for every decision
+- **Ensemble ML** — 3 models vote (Iso + RF + XGB) for per-IP decisions
+- **Dynamic IP blocking** — blocks an entire ASN with ONE ipset rule
+  (e.g. 4,401 prefixes for M247/NordVPN in 0.7s)
+- **Safety layers** — whitelist + never-block ASNs (Google, Cloudflare,
+  Akamai, AWS, DigitalOcean) + prefix caps + private-subnet guard
+- **Persistent** — Redis (hot path) + SQLite (cold path)
+- **Explainable** — SHAP values per decision
 - **Self-improving** — online learning from analyst feedback
 - **Drift-aware** — detects when the model needs retraining
-- **Tested** — 48 tests covering every module
+- **Tested** — 64 tests, all passing
 
 ---
 
@@ -56,33 +63,31 @@ Given a target server (VM) and a controller host:
 
 ```text
 ┌───────────────────────────────────────────────────────────────┐
-│                          VICTIM VM                            │
+│ CONTROLLER HOST (192.168.122.1)                               │
 │                                                               │
-│  nginx ──▶ /var/log/nginx/access.log                          │
+│ simulator/ ──attack──▶ VM                                     │
 │                                                               │
-│  victim_server.py (port 8080)                                 │
-│                                                               │
-│  iptables rules applied remotely by controller                │
-└─────────────────────┬─────────────────────────────────────────┘
-                      │ SSH tail -F
-                      ▼
+│ pipeline/live_collector ──ssh -tt tail──▶ VM nginx logs       │
+│        │                                                      │
+│        ▼                                                      │
+│ collector/aggregator (12 features)                            │
+│        │                                                      │
+│ pipeline/dynamic_ip (subnet + ASN concentration)              │
+│        │                                                      │
+│ ml/ensemble (ISO + RF + XGB)                                  │
+│        │                                                      │
+│ blocker/block_manager ──┬─▶ Redis (state)                     │
+│                         └─▶ Firewall ──ssh──▶ VM iptables     │
+│                                       └──▶ VM ipset           │
+└───────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
 ┌───────────────────────────────────────────────────────────────┐
-│                       CONTROLLER HOST                         │
-│                                                               │
-│  LiveCollector                                                │
-│      ↓                                                        │
-│  Aggregator ──▶ Ensemble (Iso+RF+XGB) ──▶ per-IP decisions    │
-│      ↓                                                        │
-│  GlobalFeatures ──▶ SubnetBlocker ──▶ subnet decisions        │
-│                                                               │
-│  Both decision streams ──▶ BlockManager                       │
-│                              ├─▶ Whitelist check              │
-│                              ├─▶ State DB                     │
-│                              ├─▶ Expiry (TTL/backoff)         │
-│                              └─▶ iptables (via SSH)           │
-│                                                               │
-│  FastAPI control plane  (port 8000)                           │
-│  Prometheus /metrics    (port 9090)                           │
+│ VICTIM VM (192.168.122.30)                                    │
+│ nginx :80 ──▶ victim_server :8080                             │
+│ logs → /var/log/nginx/ddos_access.log                         │
+│ iptables INPUT chain (DROP rules)                             │
+│ ipset ddos_asN (bulk prefix sets)                             │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,496 +95,744 @@ Given a target server (VM) and a controller host:
 
 ## Quick Start
 
-**Assumes:** Linux host with two network-reachable machines — a controller
-(your laptop) and a target VM.
-
 ```bash
-# 1. Clone / copy project
-cd /var/www/ddos_defense
+# 1. Clone
+git clone <repo> ddos-defense && cd ddos-defense
 
-# 2. Setup Python env
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
+# 2. Install deps
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-# 3. Set up the victim VM (once)
-scp deploy/install.sh naveen@192.168.122.30:~/
-ssh -t naveen@192.168.122.30 "bash ~/install.sh"
-
-# 4. Configure
+# 3. Configure
 cp config/config.example.yaml config/config.yaml
-# Edit config/config.yaml — set remote_host, whitelist
+# edit: remote_host, log_path, redis
 
-# 5. Train models (once, or when you have new data)
-python3 -m ml.train --data data/raw --model iso --version v1_iso --contamination 0.3
-python3 -m ml.train --data data/raw --model rf  --version v1_rf
-python3 -m ml.train --data data/raw --model xgb --version v1_xgb
+# 4. Build ASN database (optional but recommended)
+#    see ASN Setup section below
 
-# 6. Run the pipeline (dry-run first)
-python3 -m pipeline.runner --dry-run --duration 60
-
-# 7. Enable real blocking (edit config: blocker.dry_run = false)
+# 5. Run the defense loop
 python3 -m pipeline.runner
+
+# 6. (in another terminal) fire an attack
+python3 -m simulator.attack_scenarios \
+    --scenario dynamic_ip \
+    --target http://192.168.122.30/ \
+    --duration 30 --threads 30
 ```
 
 ---
 
-## Installation
+## VM Setup (Victim)
 
-### Prerequisites
+Run these on the victim VM (or use `deploy/install.sh`).
 
-**On the host (controller):**
+### 1. Install nginx + Python
 
-- Linux (Ubuntu 22.04+ recommended)
-- Python 3.10+
-- SSH key-based access to the VM
+```bash
+sudo apt-get update
+sudo apt-get install -y nginx python3 python3-venv
+```
 
-**On the VM (victim):**
+### 2. Create the victim HTTP server
 
-- Linux (Ubuntu 22.04+)
-- sudo access
-- Port 8080 open for the backend
+```bash
+cat > ~/victim_server.py <<'EOF'
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time, json, sys
 
-### Host Setup
+class H(BaseHTTPRequestHandler):
+    def _h(self):
+        body = json.dumps({"ok": True, "ts": time.time()}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    do_GET = do_POST = _h
+    def log_message(self, *a): pass
+
+ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
+EOF
+
+nohup python3 ~/victim_server.py > ~/victim.log 2>&1 &
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
+# → 200
+```
+
+### 3. Configure nginx with XFF trust + log format
+
+```bash
+sudo tee /etc/nginx/sites-available/ddos-lab > /dev/null <<'EOF'
+log_format ddos '$remote_addr - $remote_user [$time_local] '
+                '"$request" $status $body_bytes_sent '
+                '"$http_referer" "$http_user_agent"';
+
+server {
+    listen 80 default_server;
+    server_name _;
+
+    set_real_ip_from 192.168.122.0/24;
+    set_real_ip_from 127.0.0.1;
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+
+    access_log /var/log/nginx/ddos_access.log ddos;
+    error_log  /var/log/nginx/ddos_error.log warn;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+EOF
+
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo ln -sf /etc/nginx/sites-available/ddos-lab /etc/nginx/sites-enabled/ddos-lab
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Verify:
+
+```bash
+curl -s -H 'X-Forwarded-For: 203.0.113.42' http://localhost/ > /dev/null
+sleep 0.5
+sudo tail -1 /var/log/nginx/ddos_access.log
+# → 203.0.113.42 - - [...] "GET / HTTP/1.1" 200 ...
+```
+
+### 4. Passwordless sudo for iptables + ipset
+
+```bash
+sudo tee /etc/sudoers.d/ddos-defense > /dev/null <<EOF
+$(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables, \
+                               /usr/sbin/ipset, /sbin/iptables, /sbin/ipset
+EOF
+sudo chmod 0440 /etc/sudoers.d/ddos-defense
+sudo visudo -c
+```
+
+Verify:
+
+```bash
+sudo -n iptables -L INPUT -n | head -2
+sudo -n ipset list 2>&1 | head -2
+```
+
+### 5. Install ipset (for ASN blocking)
+
+```bash
+sudo apt-get install -y ipset
+```
+
+### 6. Install tcpdump controller (optional, for pcap capture)
+
+```bash
+sudo cp deploy/tcpdump_control.sh /usr/local/bin/tcpdump_control
+sudo chmod +x /usr/local/bin/tcpdump_control
+```
+
+---
+
+## Controller Setup
+
+Run these on the controller host (192.168.122.1).
+
+### 1. Install system dependencies
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3-venv python3-pip git redis-server \
+                        iptables ipset curl
+```
+
+### 2. Clone + venv
+
+```bash
+cd /var/www
+git clone <repo> ddos_defense
+cd ddos_defense
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 3. Configure SSH to VM (passwordless)
+
+```bash
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 2>/dev/null
+ssh-copy-id naveen@192.168.122.30
+
+# Test
+ssh -o BatchMode=yes naveen@192.168.122.30 "echo SSH_OK"
+# → SSH_OK
+```
+
+### 4. Set up ASN database (for dynamic IP blocking)
+
+```bash
+# Download pyasn + database
+pip install pyasn
+
+cd /tmp
+curl -sSL -o pyasn_dl.py https://raw.githubusercontent.com/hadiasghari/pyasn/master/pyasn-utils/pyasn_util_download.py
+curl -sSL -o pyasn_conv.py https://raw.githubusercontent.com/hadiasghari/pyasn/master/pyasn-utils/pyasn_util_convert.py
+
+python3 pyasn_dl.py --latestv4
+python3 pyasn_conv.py --single $(ls rib.*.bz2 | head -1) data/ipasn.dat
+rm -f rib.*.bz2 pyasn_dl.py pyasn_conv.py
+```
+
+Verify:
 
 ```bash
 cd /var/www/ddos_defense
-
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install --upgrade pip
-pip install -r requirements-dev.txt
+python3 -c "from collector.enrich import stats; print(stats())"
+# → 'pyasn_loaded': True
 ```
 
-### VM Setup
+### 5. Train models (if not already in `ml/models/`)
 
 ```bash
-# From the host
-scp deploy/install.sh naveen@<VM_IP>:~/
+# Collect training data first (see "Collecting labeled training data" below)
 
-# Run interactively (you'll be prompted for sudo password once)
-ssh -t naveen@<VM_IP> "bash ~/install.sh"
-```
+# Build dataset
+python3 -m ml.build_dataset --source data/collected \
+    --out data/labeled/features.csv
 
-The install script:
+# Trim to 12 HTTP features (matches inference)
+python3 - <<'EOF'
+import csv
+from pathlib import Path
+HTTP = ['pkt_rate','byte_rate','syn_ratio','avg_pkt_size','unique_dports',
+        'conn_duration','http_reqs','error_ratio','src_ip_entropy',
+        'ua_entropy','path_concentration','time_regularity']
+cols = ['window_index','scenario','ip'] + HTTP + ['label']
+rows = list(csv.DictReader(open('data/labeled/features.csv')))
+with open('data/labeled/features_http12.csv', 'w', newline='') as f:
+    w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+    w.writeheader(); w.writerows(rows)
+EOF
 
-- Installs packages (nginx, python3, curl)
-- Sets up passwordless sudo for iptables
-- Configures nginx to proxy to port 8080
-- Deploys `victim_server.py`
-- Fixes log file permissions
-- Runs end-to-end verification
+# Train
+python3 -m ml.train --data data/labeled/features_http12.csv --model iso --version v11_iso --contamination 0.2
+python3 -m ml.train --data data/labeled/features_http12.csv --model rf  --version v11_rf
+python3 -m ml.train --data data/labeled/features_http12.csv --model xgb --version v11_xgb
 
-### Verify Setup
-
-```bash
-# From the host
-
-# 1. SSH works passwordless
-ssh naveen@<VM_IP> "echo SSH_OK"
-
-# 2. Passwordless iptables works
-ssh naveen@<VM_IP> "sudo -n iptables -L INPUT -n | head -2"
-
-# 3. nginx → victim_server works
-curl -s http://<VM_IP>/ | head -c 100
-
-# 4. Log file gets traffic
-curl -s http://<VM_IP>/ > /dev/null
-ssh naveen@<VM_IP> "tail -1 /var/log/nginx/access.log"
-```
-
----
-
-## Running
-
-### The Main Loop
-
-```bash
-python3 -m pipeline.runner
-```
-
-The runner will:
-
-1. Start the log collector (SSH tail)
-2. Load the 3 ML models
-3. Initialize the blocker
-4. Loop forever, one tick every 10 seconds
-
-### Modes
-
-| Command | Behavior |
-|---|---|
-| `python3 -m pipeline.runner` | Run forever |
-| `python3 -m pipeline.runner --once` | Run one tick and exit |
-| `python3 -m pipeline.runner --dry-run` | Log decisions, don't enforce |
-| `python3 -m pipeline.runner --duration 60` | Run for 60 seconds |
-
-### Running Components Separately
-
-**Collector only (no blocking):**
-
-```bash
-python3 -m pipeline.live_collector \
-    --source ssh://naveen@<VM_IP>/var/log/nginx/access.log \
-    --duration 30
-```
-
-**Detector only:**
-
-```bash
+# Verify (should say 12 features each)
 python3 -c "
-from collector.nginx_parser import parse_file
-from collector.aggregator import aggregate
-from ml.ensemble import EnsembleDetector
-
-det = EnsembleDetector(threshold=0.7)
-feats = aggregate(parse_file('data/raw/training.log'))
-for ip, f in feats.items():
-    d = det.predict(f)
-    print(f'{ip:15s} → {d.action:8s} (conf={d.confidence:.2f})')
+import joblib
+for v in ['v11_iso','v11_rf','v11_xgb']:
+    m = joblib.load(f'ml/models/{v}.pkl')
+    print(f'{v}: {m.n_features_in_} features')
 "
 ```
 
-**API server:**
+### 6. Start Redis (if not already running)
 
 ```bash
-uvicorn api.app:app --host 0.0.0.0 --port 8000
+sudo systemctl start redis-server
+redis-cli ping
+# → PONG
 ```
 
-**Metrics endpoint:**
+### 7. Configure the controller
 
 ```bash
-python3 -m monitoring.metrics --port 9090
+cp config/config.example.yaml config/config.yaml
 ```
 
----
-
-## Components
-
-### 1. Collector
-
-Tails logs and parses them into structured records.
-
-| Module | Purpose |
-|---|---|
-| `collector/nginx_parser.py` | Parse nginx log lines (supports multiple time formats) |
-| `collector/aggregator.py` | Group records by IP, compute 9-dim feature vectors |
-| `pipeline/live_collector.py` | SSH tail with auto-reconnect |
-| `deploy/remote_collector.py` | Robust SSH tail with preflight checks |
-
-### 2. Machine Learning
-
-| Module | Purpose |
-|---|---|
-| `ml/train.py` | Train Iso / RF / XGB models |
-| `ml/detector.py` | Single-model inference wrapper |
-| `ml/ensemble.py` | 3-model weighted-vote ensemble |
-| `ml/feature_engineering.py` | Temporal features (10 extra per IP) |
-| `ml/data_loader.py` | Load labeled training data |
-| `ml/augmenter.py` | SMOTE-style synthetic attack generation |
-| `ml/hyperparameter_tuner.py` | Random/Grid search for best params |
-| `ml/cross_validator.py` | K-fold CV with bootstrap CI |
-| `ml/threshold_optimizer.py` | Find optimal blocking threshold |
-| `ml/explainability.py` | SHAP values for decisions |
-| `ml/drift_detector.py` | Detect model staleness (KS + PSI) |
-| `ml/online_learning.py` | Feedback-driven retraining |
-| `ml/sequence_model.py` | LSTM for temporal patterns |
-| `ml/graph_detector.py` | Botnet clustering via graph analysis |
-| `ml/global_features.py` | Cross-IP features (rotation, churn, entropy) |
-
-### 3. Blocker
-
-| Module | Purpose |
-|---|---|
-| `blocker/whitelist.py` | Never-block list (safety) |
-| `blocker/state.py` | SQLite persistence of blocks |
-| `blocker/expiry.py` | TTL + exponential backoff |
-| `blocker/firewall.py` | iptables wrapper (local or SSH) |
-| `blocker/block_manager.py` | Orchestrator |
-| `blocker/subnet_blocker.py` | Block whole /24s for botnet attacks |
-
-### 4. Pipeline
-
-| Module | Purpose |
-|---|---|
-| `pipeline/live_collector.py` | SSH tail → parsed records |
-| `pipeline/runner.py` | Main defense loop |
-| `pipeline/dynamic_ip.py` | Detect rotating IP attacks |
-
-### 5. API
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /health` | Health check |
-| `GET /blocks/` | List active blocks |
-| `GET /blocks/{ip}` | Get specific block |
-| `POST /blocks/block` | Manually block an IP |
-| `POST /blocks/{ip}/unblock` | Manually unblock |
-| `GET /stats/summary` | Stats summary |
-| `GET /stats/history` | Block/unblock history |
-| `POST /admin/reload-model` | Trigger model reload |
-| `POST /admin/purge-expired` | Clean expired records |
-
-### 6. Deployment
-
-| Module | Purpose |
-|---|---|
-| `deploy/remote_collector.py` | Preflight + robust SSH tail |
-| `deploy/remote_blocker.py` | Preflight + robust iptables |
-| `deploy/install.sh` | One-shot VM setup |
-
-### 7. Monitoring
-
-| Module | Purpose |
-|---|---|
-| `monitoring/metrics.py` | Prometheus metrics |
-| `monitoring/alerts.yml` | Alert rules (11 total) |
-
----
-
-## Attack Types Detected
-
-| Attack | Detection Layer | Action |
-|---|---|---|
-| HTTP flood | Ensemble (per-IP) | Block IP |
-| Slowloris | Ensemble + IsolationForest | Block IP |
-| SYN flood | Per-IP features | Block IP |
-| Rotating botnet | GlobalFeatures + SubnetBlocker | Block /24 |
-| Coordinated subnet attack | SubnetBlocker | Block /24 |
-| Distributed low-rate | GlobalFeatures | Block subnet |
-| Unknown zero-day | IsolationForest | Block IP |
-| Spoofed UA/path | Entropy analysis | Block subnet |
-
----
-
-## Configuration
-
-All config lives in `config/config.yaml`:
+Edit `config/config.yaml`:
 
 ```yaml
-app:
-  name: ddos-defense
-  log_level: INFO
+redis:
+  host: localhost
+  port: 6379
 
 collector:
-  window_seconds: 10
-  source: nginx
-  log_path: /var/log/nginx/access.log
+  log_path: /var/log/nginx/ddos_access.log
   remote_log: true
   remote_host: naveen@192.168.122.30
   use_sudo: false
 
 ml:
-  model_path: ml/models/v1_xgb.pkl
   ensemble:
-    iso_path: ml/models/v1_iso.pkl
-    rf_path: ml/models/v1_rf.pkl
-    xgb_path: ml/models/v1_xgb.pkl
-  threshold: 0.7
+    iso_path: ml/models/v11_iso.pkl
+    rf_path: ml/models/v11_rf.pkl
+    xgb_path: ml/models/v11_xgb.pkl
   weights:
-    v1_iso: 0.20
-    v1_rf: 0.35
-    v1_xgb: 0.45
+    iso: 0.20
+    rf: 0.35
+    xgb: 0.45
 
 blocker:
   backend: iptables
-  chain: INPUT
-  rule_target: DROP
-  dry_run: true                      # ← flip to false for real blocking
+  dry_run: false
   remote_host: naveen@192.168.122.30
-  remote_sudo: true
-
-  default_ttl: 60
-  backoff_seconds:
-    - 60
-    - 300
-    - 1800
-    - 86400
-  permanent_after_strike: 5
-  max_ttl: 86400
-
+  use_ipset: true
+  max_asn_prefixes: 5000
+  asn_db_path: data/ipasn.dat
   whitelist:
     - 127.0.0.1
+    - 192.168.122.1
     - 192.168.122.30
     - 10.0.0.0/8
     - 172.16.0.0/12
     - 192.168.0.0/16
 ```
 
-### Important Settings
+---
 
-| Setting | Meaning |
-|---|---|
-| `ml.threshold` | Block if P(attack) >= this (0.7 = balanced) |
-| `blocker.dry_run` | `true` = log only, `false` = real iptables |
-| `blocker.whitelist` | IPs/ranges never blocked |
-| `blocker.backoff_seconds` | TTL per strike (escalates) |
-| `blocker.permanent_after_strike` | When to stop escalating |
-| `pipeline.dynamic_ip.enabled` | Enable subnet blocking |
+## Running the System
+
+### Sanity check first
+
+```bash
+cd /var/www/ddos_defense
+source .venv/bin/activate
+
+# 1. Redis
+python3 -m blocker.redis_state ping
+
+# 2. VM reachable
+ssh -o BatchMode=yes naveen@192.168.122.30 "echo OK"
+
+# 3. Firewall reachable
+ssh naveen@192.168.122.30 "sudo -n iptables -L INPUT -n | head -2"
+
+# 4. Model feature count
+python3 -c "import joblib; print(joblib.load('ml/models/v11_xgb.pkl').n_features_in_)"
+# → 12
+
+# 5. Live collector (should print stats after 5s)
+python3 -c "
+import time
+from pipeline.live_collector import LiveCollector
+lc = LiveCollector('ssh://naveen@192.168.122.30/var/log/nginx/ddos_access.log')
+lc.start(); time.sleep(5); print(lc.stats()); lc.stop()
+"
+```
+
+### Run the defense loop
+
+```bash
+python3 -m pipeline.runner --dry-run --duration 60
+```
+
+You'll see tick output every 10s:
+
+```text
+tick 1: no records in last 10s
+tick 2: records=3940 ips=533 per_ip=0 subnet=1 blocks=1 (47675ms)
+```
+
+### Switch to live enforcement
+
+Edit `config/config.yaml`:
+
+```yaml
+blocker:
+  dry_run: false
+```
+
+Restart the runner.
 
 ---
 
-## Testing
+## Testing Dynamic IP Blocking
+
+This is the key test — a rotating-IP attack where no single IP looks bad,
+but the aggregate pattern is clearly malicious.
+
+### Step 1 — Clean slate
 
 ```bash
-# Activate env
+cd /var/www/ddos_defense
 source .venv/bin/activate
 
-# Run all tests
-pytest
+# Reset state
+python3 -m blocker.redis_state clear
+rm -f data/firewall_blocked.txt data/firewall_asn_index.json
 
-# Verbose
-pytest -v
-
-# With coverage
-pytest --cov=. --cov-report=term-missing
-
-# Run a specific test file
-pytest tests/test_blocker.py -v
-
-# Run a specific test
-pytest tests/test_blocker.py::TestState::test_permanent_block -v
+# Flush VM firewall
+ssh naveen@192.168.122.30 "sudo -n iptables -F INPUT"
+ssh naveen@192.168.122.30 "sudo -n ipset destroy 2>/dev/null || true"
 ```
 
-### Test Coverage
+### Step 2 — Terminal 1: run the runner
 
-| Test file | Tests | Covers |
-|---|---|---|
-| `test_blocker.py` | 21 | Whitelist, state, expiry, firewall |
-| `test_pipeline.py` | 14 | Parser, aggregator, collector, dynamic IP |
-| `test_dynamic_ip.py` | 9 | Subnet blocking, global features |
-| `test_collector.py` | 1 | Parser smoke test |
-| `test_detector.py` | 1 | Detector interface |
-| `test_features.py` | 1 | Feature schema |
-| `test_integration.py` | 1 | End-to-end |
-| **Total** | **48** | — |
+```bash
+python3 -m pipeline.runner --duration 60
+```
 
-All tests should pass in ~2 seconds.
+### Step 3 — Terminal 2: fire the attack (within 10s)
+
+```bash
+python3 -m simulator.attack_scenarios \
+    --scenario dynamic_ip \
+    --target http://192.168.122.30/ \
+    --duration 30 --threads 30
+```
+
+### Step 4 — Watch Terminal 1
+
+You should see:
+
+```text
+dynamic IP signal: 592 IPs, top ASN 9009 (90%), dc_share=100%
+ASN BLOCK DECISION: AS9009 (datacenter) share=90% dc_share=100% ttl=300s
+tick 4: subnet/ASN block active — skipping 592 per-IP decisions
+AS9009 → 4401 IPv4 prefixes
+BLOCKED AS9009 via ipset (4401 prefixes, 0.70s)
+ENFORCED block on AS9009  scope=asn  ttl=5.0min
+tick 4: records=5728 ips=592 per_ip=0 subnet=1 blocks=1 (724ms)
+```
+
+What just happened:
+
+- 592 unique IPs, each sending 1-2 requests → per-IP ML couldn't flag them
+- Detector saw 90% concentration on ASN 9009 (M247, NordVPN's ASN)
+- Blocked the entire ASN — 4,401 prefixes in ONE ipset rule
+
+### Step 5 — Verify on the VM
+
+```bash
+# ipset holds all 4,401 prefixes for AS9009
+ssh naveen@192.168.122.30 "sudo -n ipset list ddos_as9009 | head -8"
+
+# One iptables rule references the set
+ssh naveen@192.168.122.30 "sudo -n iptables -L INPUT -n"
+# DROP  all  --  0.0.0.0/0  0.0.0.0/0  match-set ddos_as9009 src
+```
+
+### Step 6 — Cleanup
+
+```bash
+ssh naveen@192.168.122.30 "sudo -n ipset destroy ddos_as9009"
+ssh naveen@192.168.122.30 "sudo -n iptables -F INPUT"
+python3 -m blocker.redis_state clear
+```
+
+### Comparing attack modes
+
+| Scenario                   | Source IPs | Detected by          | Blocked by            |
+| -------------------------- | ---------- | -------------------- | --------------------- |
+| `http_flood`               | 1          | Per-IP ML            | Single iptables rule  |
+| `dynamic_ip` (90% pool)    | 592+       | ASN concentration    | ipset (4401 prefixes) |
+| `dynamic_ip` (equal pools) | 592+       | Datacenter share     | Top datacenter ASN    |
+| `distributed`              | fake XFF   | Subnet concentration | /24                   |
+
+---
+
+## Docker Deployment
+
+The entire stack runs in Docker Compose: Redis, runner, API, metrics
+exporter, Prometheus, Pushgateway, Grafana.
+
+### Prerequisites
+
+- Docker + Docker Compose v2
+- Docker Desktop file sharing must include `/var/www`
+  (Settings → Resources → File Sharing)
+
+### Start
+
+```bash
+cd /var/www/ddos_defense
+docker compose up -d --build
+docker compose ps
+```
+
+### Load Prometheus + Grafana configs (one-time, after first start)
+
+Docker named volumes are used, so configs must be copied in:
+
+```bash
+# Prometheus
+docker cp monitoring/prometheus/prometheus.yml ddos-prometheus:/etc/prometheus/
+docker cp monitoring/prometheus/alerts.yml     ddos-prometheus:/etc/prometheus/
+docker exec ddos-prometheus kill -HUP 1
+
+# Grafana dashboards + datasource
+docker exec ddos-grafana mkdir -p /etc/grafana/provisioning/datasources
+docker exec ddos-grafana mkdir -p /etc/grafana/provisioning/dashboards
+docker cp monitoring/grafana/provisioning/datasources/prometheus.yml \
+    ddos-grafana:/etc/grafana/provisioning/datasources/
+docker cp monitoring/grafana/provisioning/dashboards/default.yml \
+    ddos-grafana:/etc/grafana/provisioning/dashboards/
+docker cp monitoring/grafana/provisioning/dashboards/ddos.json \
+    ddos-grafana:/etc/grafana/provisioning/dashboards/
+docker restart ddos-grafana
+```
+
+### Verify
+
+```bash
+docker compose ps
+curl -s http://localhost:8000/health | python3 -m json.tool
+curl -s http://localhost:9090/api/v1/targets | python3 -m json.tool | grep health
+curl -s http://localhost:9100/metrics | grep -c '^ddos_'
+```
+
+### Access
+
+| Service     | URL                   | Credentials   |
+| ----------- | --------------------- | ------------- |
+| Grafana     | http://localhost:3001 | admin / admin |
+| Prometheus  | http://localhost:9090 | —             |
+| API         | http://localhost:8000 | —             |
+| Pushgateway | http://localhost:9091 | —             |
+
+### SSH to VM from runner container
+
+The runner container needs `~/.ssh` mounted. This is already configured in
+`docker-compose.yml`. The container reaches the VM via the host's
+`192.168.122.x` network — no special config needed if the host has the route.
+
+If not reachable:
+
+```yaml
+runner:
+  network_mode: host
+```
+
+### Stop / clean
+
+```bash
+docker compose down           # stop, keep volumes
+docker compose down -v        # stop + wipe volumes
+```
 
 ---
 
 ## Monitoring
 
-### Prometheus
+### Metrics
 
-```bash
-# Start /metrics endpoint
-python3 -m monitoring.metrics --port 9090
-```
+Prometheus scrapes 3 targets:
 
-Then add to `prometheus.yml`:
+- `ddos-api:8000` — API process metrics
+- `ddos-metrics:9100` — custom exporter (Redis + firewall state)
+- `pushgateway:9091` — runner metrics (pushed each tick)
+
+Key metrics:
+
+| Metric                       | Type      | Meaning                        |
+| ---------------------------- | --------- | ------------------------------ |
+| `ddos_decisions_total`       | counter   | Decisions by action + source   |
+| `ddos_blocks_total`          | counter   | Blocks by model + strike range |
+| `ddos_active_blocks`         | gauge     | Current active block count     |
+| `ddos_tick_latency_seconds`  | histogram | Per-tick processing time       |
+| `ddos_attack_probability`    | gauge     | Latest ensemble P(attack)      |
+| `ddos_collector_buffer_size` | gauge     | Records in collector buffer    |
+
+### Alerts (in `monitoring/alerts.yml`)
+
+| Alert                   | Trigger                    | Severity |
+| ----------------------- | -------------------------- | -------- |
+| `HighBlockRate`         | > 10 blocks/s for 30s      | warning  |
+| `VeryHighBlockRate`     | > 50 blocks/s for 15s      | critical |
+| `ManyActiveBlocks`      | > 100 concurrent           | warning  |
+| `CollectorDisconnected` | buffer empty 30s           | critical |
+| `HighPipelineLatency`   | P95 tick > 1s              | warning  |
+| `HighConfidenceAttacks` | avg P(attack) > 0.9 for 2m | critical |
+
+### Grafana
+
+The dashboard (auto-provisioned) shows:
+
+- Block Rate (blocks/sec)
+- Active Blocks
+- Tick Latency (P50/P95/P99)
+- Blocks/sec over time
+- Decisions/sec by action
+- Collector health
+
+### Alerts (production)
+
+For alerting to Slack/email, add Alertmanager:
 
 ```yaml
-scrape_configs:
-  - job_name: ddos-defense
-    static_configs:
-      - targets: ['localhost:9090']
+# docker-compose.yml
+alertmanager:
+  image: prom/alertmanager:v0.27.0
+  ports: ["9093:9093"]
+  volumes:
+    - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
 ```
 
-### Key Metrics
+---
 
-| Metric | Type | Meaning |
-|---|---|---|
-| `ddos_decisions_total` | Counter | Decisions by action/source |
-| `ddos_blocks_total` | Counter | Blocks enforced |
-| `ddos_active_blocks` | Gauge | Currently blocked IPs |
-| `ddos_tick_latency_seconds` | Histogram | Processing time per tick |
-| `ddos_attack_probability` | Gauge | Latest P(attack) |
-| `ddos_collector_connected` | Gauge | 1 if connected, 0 if not |
+## Attack Scenarios
 
-### Alerts
+All scenarios live in `simulator/attack_scenarios.py`.
 
-11 alert rules in `monitoring/alerts.yml`:
+| Scenario        | Description                                          |
+| --------------- | ---------------------------------------------------- |
+| `http_flood`    | Single-IP volumetric flood (tests per-IP ML)         |
+| `slowloris`     | Connection exhaustion via slow reads                 |
+| `ramping_flood` | Gradually increasing rate (tests temporal detection) |
+| `bursty_flood`  | On/off burst pattern                                 |
+| `distributed`   | XFF-spoofed requests (fake IPs)                      |
+| `mixed`         | Normal traffic + attack blend                        |
+| `dynamic_ip`    | Rotating IPs, weighted 90% to one ASN                |
 
-- **HighBlockRate** — > 10 blocks/sec
-- **VeryHighBlockRate** — > 50 blocks/sec (critical)
-- **CollectorDisconnected** — pipeline is blind
-- **HighPipelineLatency** — processing too slow
-- **PipelineErrors** — errors/sec > 0
-- ... (see file for full list)
+### Running any scenario
+
+```bash
+python3 -m simulator.attack_scenarios \
+    --scenario dynamic_ip \
+    --target http://192.168.122.30/ \
+    --duration 30 \
+    --threads 30
+```
+
+### Collecting labeled training data
+
+```bash
+python3 -m simulator.collector \
+    --scenario dynamic_ip \
+    --target http://192.168.122.30/ \
+    --vm-host naveen@192.168.122.30 \
+    --duration 15 --warmup 3 --cooldown 3
+```
+
+Output: `data/collected/<timestamp>_dynamic_ip.{log,jsonl,meta.json,pcap}`
+
+---
+
+## Configuration Reference
+
+### `config/config.yaml` — key fields
+
+```yaml
+redis:
+  host: localhost
+  port: 6379
+
+collector:
+  log_path: /var/log/nginx/ddos_access.log
+  remote_log: true
+  remote_host: naveen@192.168.122.30
+  use_sudo: false
+  window_seconds: 10
+  max_age: 3600
+
+ml:
+  ensemble:
+    iso_path: ml/models/v11_iso.pkl
+    rf_path: ml/models/v11_rf.pkl
+    xgb_path: ml/models/v11_xgb.pkl
+  weights:
+    iso: 0.20
+    rf: 0.35
+    xgb: 0.45
+  threshold: 0.7
+
+blocker:
+  backend: iptables
+  dry_run: false # true = log-only, false = real enforcement
+  remote_host: naveen@192.168.122.30
+  use_ipset: true # true = fast ASN blocks via ipset
+  max_asn_prefixes: 5000 # refuse to block larger ASNs
+  asn_db_path: data/ipasn.dat
+  whitelist: [...] # never-block list
+
+pipeline:
+  window_seconds: 10
+  dynamic_ip:
+    enabled: true
+    subnet_size: 24
+    new_ip_threshold: 20
+```
+
+### `dry_run` semantics
+
+| Value   | Behavior                                     |
+| ------- | -------------------------------------------- |
+| `true`  | Decisions logged, iptables/ipset NOT touched |
+| `false` | Real enforcement on the VM                   |
+
+Use `true` for testing, `false` for production.
 
 ---
 
 ## Troubleshooting
 
-### "no records in last 10s"
+### Runner shows `no records in last 10s`
 
-**Cause:** Collector isn't reading logs.
-
-**Check:**
+Check nginx logs on the VM:
 
 ```bash
-# 1. VM reachable?
-ping <VM_IP>
-
-# 2. SSH works?
-ssh naveen@<VM_IP> "echo OK"
-
-# 3. Log file exists?
-ssh naveen@<VM_IP> "ls -la /var/log/nginx/access.log"
-
-# 4. Direct tail works?
-ssh naveen@<VM_IP> "timeout 3 tail -F -n 0 /var/log/nginx/access.log" &
-curl http://<VM_IP>/ > /dev/null
-sleep 1
-kill %1
+ssh naveen@192.168.122.30 "sudo -n tail -5 /var/log/nginx/ddos_access.log"
 ```
 
-### "sudo: interactive authentication is required"
-
-**Cause:** Passwordless sudo not configured on the VM.
-
-**Fix:** Re-run `install.sh`, or manually:
+Check the collector:
 
 ```bash
-sudo tee /etc/sudoers.d/ddos-defense > /dev/null <<EOF
-$(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/iptables, /usr/sbin/ip6tables
-EOF
-sudo chmod 0440 /etc/sudoers.d/ddos-defense
-sudo visudo -c
+python3 -c "import time; from pipeline.live_collector import LiveCollector; lc=LiveCollector('ssh://naveen@192.168.122.30/var/log/nginx/ddos_access.log'); lc.start(); time.sleep(5); print(lc.stats()); lc.stop()"
 ```
 
-### "from __future__ imports must occur at the beginning of the file"
-
-**Cause:** A comment or code above the docstring/code.
-
-**Fix:** Ensure line 1 is the docstring and line 2+ is
-`from __future__ import annotations`. Delete and re-create the file cleanly.
-
-### Blocks not appearing in iptables
-
-**Cause:** `blocker.dry_run: true` in config.
-
-**Fix:** Set to `false`, restart the pipeline.
-
-### Pipeline blocks my SSH session
-
-**Cause:** Your IP isn't whitelisted.
-
-**Fix:** Add it to `blocker.whitelist` in config. If you're already locked
-out, SSH from a different machine and remove the rule manually:
+If `lines=0` → SSH PTY issue. Verify this works:
 
 ```bash
-ssh <other-machine>
-ssh naveen@<VM_IP>
-sudo iptables -D INPUT -s <your-ip> -j DROP
+ssh -tt naveen@192.168.122.30 "tail -1 /var/log/nginx/ddos_access.log"
 ```
 
-### Restarting from scratch
+### `ensemble weights must sum to a positive value`
+
+`config.ml.weights` keys must match `model_paths` keys (`iso`, `rf`, `xgb`),
+**not** `v1_iso`, `v1_rf`, `v1_xgb`.
+
+### `X has 12 features, but IsolationForest is expecting 9`
+
+Retrain models on the current schema (12 features):
 
 ```bash
-# Clean up
-rm -f data/blocker_state.db
-rm -f data/firewall_blocked.txt
-ssh naveen@<VM_IP> "sudo iptables -F INPUT"    # careful!
+python3 -m ml.train --data data/labeled/features_http12.csv --model xgb --version v11_xgb
+```
 
-# Reinstall VM
-scp deploy/install.sh naveen@<VM_IP>:~/
-ssh -t naveen@<VM_IP> "bash ~/install.sh"
+### `redis-py not installed`
+
+```bash
+pip install redis
+```
+
+Or in Docker: add `redis` to `requirements.txt` and rebuild.
+
+### `iptables: Bad rule (does a matching rule exist in that chain?)`
+
+Harmless — cosmetic. `unblock()` treats this as success.
+
+### Docker: `address already in use`
+
+Host services occupy ports. Kill them:
+
+```bash
+sudo pkill prometheus
+sudo pkill grafana-server
+pkill -f monitoring.exporters.custom_metrics
+sudo systemctl stop redis-server
+```
+
+### Docker: `not a directory` on config mount
+
+Docker Desktop file-sharing issue. Use named volumes (see
+`docker-compose.yml`) or move the project under `$HOME`.
+
+### Grafana shows "No data"
+
+Confirm Prometheus has the data:
+
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=ddos_blocks_total'
+```
+
+If empty, Pushgateway isn't being scraped. Check:
+
+```bash
+curl -s http://localhost:9091/metrics | grep ddos_
+curl -s http://localhost:9090/api/v1/targets | grep -A2 pushgateway
 ```
 
 ---
@@ -587,65 +840,8 @@ ssh -t naveen@<VM_IP> "bash ~/install.sh"
 ## Project Structure
 
 ```text
-ddos-defense/
-├── README.md                    ← this file
-├── requirements.txt
-├── requirements-dev.txt
-├── pytest.ini
-│
-├── config/
-│   ├── config.yaml              ← main config
-│   └── config.example.yaml
-│
-├── core/                        # shared primitives
-│   ├── schema.py                # feature names, Decision, BlockRecord
-│   ├── logging.py               # JSON logging
-│   ├── config_loader.py
-│   └── types.py
-│
-├── simulator/
-│   ├── traffic_generator.py     # attack traffic generator
-│   ├── scenarios.py
-│   └── configs/                 # scenario YAMLs
-│
-├── collector/
-│   ├── nginx_parser.py          # parse log lines
-│   ├── aggregator.py            # per-IP features
-│   └── fixtures/
-│
-├── ml/                          # 15 modules
-│   ├── features.py
-│   ├── train.py
-│   ├── detector.py
-│   ├── ensemble.py
-│   ├── feature_engineering.py
-│   ├── data_loader.py
-│   ├── augmenter.py
-│   ├── hyperparameter_tuner.py
-│   ├── cross_validator.py
-│   ├── threshold_optimizer.py
-│   ├── explainability.py
-│   ├── drift_detector.py
-│   ├── online_learning.py
-│   ├── sequence_model.py
-│   ├── graph_detector.py
-│   ├── global_features.py
-│   └── models/                  # trained .pkl files
-│
-├── blocker/                     # 6 modules
-│   ├── whitelist.py
-│   ├── state.py
-│   ├── expiry.py
-│   ├── firewall.py
-│   ├── block_manager.py
-│   └── subnet_blocker.py
-│
-├── pipeline/                    # 3 modules
-│   ├── live_collector.py
-│   ├── runner.py
-│   └── dynamic_ip.py
-│
-├── api/                         # 7 modules
+ddos_defense/
+├── api/                    FastAPI control plane
 │   ├── app.py
 │   ├── schemas.py
 │   └── routes/
@@ -653,52 +849,56 @@ ddos-defense/
 │       ├── blocks.py
 │       ├── stats.py
 │       └── admin.py
-│
-├── deploy/                      # 3 modules
-│   ├── remote_collector.py
+├── blocker/                Enforcement
+│   ├── block_manager.py    Orchestrator
+│   ├── firewall.py         iptables + ipset
+│   ├── redis_state.py      Persistent state
+│   ├── state.py            SQLite fallback
+│   ├── expiry.py           TTL + backoff
+│   ├── whitelist.py
+│   └── subnet_blocker.py
+├── collector/              Log parsing + features
+│   ├── nginx_parser.py
+│   ├── aggregator.py       12 HTTP features
+│   ├── enrich.py           Subnet + ASN
+│   └── packet_features.py  30 pcap features (offline)
+├── ml/                     Machine learning
+│   ├── ensemble.py         3-model voting
+│   ├── detector.py
+│   ├── train.py
+│   ├── build_dataset.py
+│   └── models/             Trained .pkl files
+├── pipeline/               Runtime
+│   ├── runner.py           Main loop
+│   ├── live_collector.py   SSH PTY tail
+│   └── dynamic_ip.py       ASN/subnet detector
+├── simulator/              Attack generation
+│   ├── attack_scenarios.py
+│   └── collector.py        Labeled data collection
+├── monitoring/             Observability
+│   ├── prometheus/
+│   ├── exporters/
+│   ├── grafana/
+│   └── metrics.py
+├── deploy/                 Deployment helpers
+│   ├── install.sh
 │   ├── remote_blocker.py
-│   └── install.sh               # VM setup script
-│
-├── monitoring/                  # 3 modules
-│   ├── metrics.py
-│   ├── alerts.yml
-│   └── grafana/
-│
-├── data/
-│   ├── raw/                     # training logs
-│   ├── labeled/                 # labels.jsonl
-│   ├── processed/
-│   └── blocker_state.db         # SQLite
-│
-└── tests/                       # 7 test files, 48 tests
-    ├── test_blocker.py
-    ├── test_pipeline.py
-    ├── test_dynamic_ip.py
-    ├── test_collector.py
-    ├── test_detector.py
-    ├── test_features.py
-    └── test_integration.py
+│   └── tcpdump_control.sh
+├── config/
+│   └── config.yaml
+├── data/                   Runtime state
+│   ├── collected/          Training data
+│   ├── labeled/
+│   └── ipasn.dat           ASN database
+├── tests/                  64 tests
+├── docs/                   Architecture + diagrams
+├── Dockerfile
+├── docker-compose.yml
+└── README.md
 ```
 
 ---
 
 ## License
 
-Educational / learning project. Use freely for learning DDoS defense.
-
-> ⚠️ **Warning:** Only run against systems you own. Unauthorized DDoS
-> attacks are illegal in most jurisdictions and can result in criminal
-> prosecution.
-
----
-
-## Acknowledgments
-
-Built as a complete learning exercise covering:
-
-- **Networking** (SSH, TCP/IP, iptables)
-- **Machine learning** (ensemble methods, anomaly detection, drift)
-- **Systems** (SQLite, threads, subprocess)
-- **Security** (whitelists, rate limiting, spoofing)
-- **Ops** (systemd, Prometheus, deployment)
-- **Testing** (pytest, coverage, fixtures)
+Naveen Saini
