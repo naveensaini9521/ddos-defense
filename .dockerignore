@@ -1,0 +1,14 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+data/collected
+data/raw
+data/labeled
+data/*.db
+*.log
+.git
+node_modules
+/tmp
+docs/diagrams
