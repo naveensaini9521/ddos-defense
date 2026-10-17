@@ -1,0 +1,103 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: ddos-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  runner:
+    build: .
+    container_name: ddos-runner
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: python3 -m pipeline.runner
+    environment:
+      - REDIS_HOST=redis
+    volumes:
+      - ./config:/app/config:ro
+      - ./ml/models:/app/ml/models:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ${HOME}/.ssh:/root/.ssh:ro
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: ddos-api
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn api.app:app --host 0.0.0.0 --port 8000
+    environment:
+      - REDIS_HOST=redis
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ml/models:/app/ml/models:ro
+      - ./data:/app/data
+    restart: unless-stopped
+
+  metrics:
+    build: .
+    container_name: ddos-metrics
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: python3 -m monitoring.exporters.custom_metrics --port 9100
+    environment:
+      - REDIS_HOST=redis
+    ports:
+      - "9110:9100"
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: ddos-prometheus
+    depends_on:
+      - api
+      - metrics
+    ports:
+      - "9092:9090"
+    volumes:
+      - prometheus-config:/etc/prometheus
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+
+  pushgateway:
+    image: prom/pushgateway:v1.9.0
+    container_name: ddos-pushgateway
+    ports:
+      - "9091:9091"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: ddos-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  prometheus-config:
+  prometheus-data:
+  grafana-data:
