@@ -412,12 +412,17 @@ class Firewall:
 
         # 3. single iptables rule
         if self.cfg.backend == "iptables":
-            args = ["-I", self.cfg.chain,
-                    "-m", "set", "--match-set", set_name, "src",
-                    "-j", self.cfg.rule_target]
+            check_args = ["-C", self.cfg.chain,
+                          "-m", "set", "--match-set", set_name, "src",
+                          "-j", self.cfg.rule_target]
+            check = self._run(check_args)
+            if not check.ok:
+                add_args = ["-I", self.cfg.chain,
+                            "-m", "set", "--match-set", set_name, "src",
+                            "-j", self.cfg.rule_target]
+                self._run(add_args)
         else:
-            args = ["[null]", set_name]
-        self._run(args)
+            self._run(["[null]", set_name])
 
         self._asn_index[asn] = list(prefixes)
         self._save_blocked()
